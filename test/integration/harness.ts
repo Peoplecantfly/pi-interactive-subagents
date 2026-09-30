@@ -68,10 +68,24 @@ const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.
 // ── Configuration ──
 
 /** Model used for integration tests. Override with PI_TEST_MODEL env var. */
-export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "anthropic/claude-haiku-4-5";
+export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "usergate/Qwen3.8-27B";
 
-/** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var. */
-export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
+/** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var.
+ * 300s default: tests run real LLM sessions; a 27B gateway model can take
+ * 30-90s per turn, and lifecycle tests chain parent + child turns. */
+export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "300000");
+
+/**
+ * pi binary the test panes run: PI_TEST_BIN override, else the pi installed
+ * next to the node executing the tests (same install as the runner), else
+ * bare `pi`. `npm run` prepends the project's node_modules/.bin — which holds
+ * an older pi from devDependencies — to PATH, so bare `pi` is not safe.
+ */
+function resolveTestPiBin(): string {
+  if (process.env.PI_TEST_BIN) return shellEscape(process.env.PI_TEST_BIN);
+  const sibling = join(dirname(process.execPath), "pi");
+  return existsSync(sibling) ? shellEscape(sibling) : "pi";
+}
 
 // ── Backend detection ──
 
@@ -215,9 +229,11 @@ export function startPi(
   // snapshot). `-ne` disables extension auto-discovery, `-e <path>` loads the
   // current branch's source directly. Without this, the tests silently run
   // against whatever version is checked out under `~/.pi/agent/git/...`.
+  // Pin the binary to the runner's own install (npm run puts the project's
+  // node_modules/.bin — with an older pi — first on PATH).
   const cmd = [
     `cd ${shellEscape(testDir)} &&`,
-    `pi`,
+    resolveTestPiBin(),
     `-ne`,
     `-e ${shellEscape(EXTENSION_SOURCE)}`,
     `--model ${shellEscape(model)}`,
