@@ -114,6 +114,19 @@ export interface SubagentLoadout {
   cwd: string | null;
   /** PI_CODING_AGENT_DIR the subagent resolved config/extensions from, or null. */
   agentDir: string | null;
+  /**
+   * Explicit `-e` extensions the spawning parent session's pi process was
+   * started with (absolute paths, or `builtin:<name>` verbatim). Absent in
+   * snapshots written before extension inheritance existed.
+   */
+  extensions?: string[];
+  /**
+   * The parent session's discovery mode: true when the parent was started
+   * with `--no-extensions`/`-ne` (the child mirrors that). Absent in
+   * snapshots written before extension inheritance existed — resume falls
+   * back to the legacy rule (restricted spawn → `--no-extensions`).
+   */
+  noExtensions?: boolean;
 }
 
 /** Path of the loadout sidecar written next to a subagent session file. */

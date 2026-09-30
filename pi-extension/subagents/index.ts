@@ -64,6 +64,19 @@ import {
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 
+/**
+ * pi binary child sessions run. Prefer the pi installed next to the node
+ * executing this extension (guarantees child == parent version) so a pane
+ * shell PATH that resolves a different/older pi cannot be picked up.
+ * Override with PI_BIN. Falls back to bare `pi` when no sibling exists
+ * (e.g. npx or bundled installs).
+ */
+function resolvePiBin(): string {
+  if (process.env.PI_BIN) return process.env.PI_BIN;
+  const sibling = join(dirname(process.execPath), "pi");
+  return existsSync(sibling) ? sibling : "pi";
+}
+
 // Survive /reload: clear timers and abort poll loops from the previous module load.
 // /reload re-imports this file, giving fresh module-level state, but closures from
 // the old module keep running. See https://github.com/HazAT/pi-interactive-subagents/issues/5
@@ -202,6 +215,35 @@ export function registerToolExtension(name: string, extensionPath: string): void
 (globalThis as any).__pi_interactive_subagents = {
   registerToolExtension,
 };
+
+/**
+ * Parse the pi CLI args of THIS session for the extension environment.
+ *
+ * The extension runs in-process, so `process.argv` is the parent session's
+ * own pi command line. This extracts (a) the explicit `-e`/`--extension`
+ * values and (b) whether discovery was disabled with `--no-extensions`/`-ne`,
+ * so a spawned subagent can inherit exactly the extension environment the
+ * parent runs with. Relative paths are resolved against the parent's working
+ * directory; `builtin:<name>` values pass through verbatim.
+ */
+export function parseParentExtensionFlags(argv: string[] = process.argv): {
+  explicit: string[];
+  noExtensions: boolean;
+} {
+  const explicit: string[] = [];
+  let noExtensions = false;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--extension" || arg === "-e") {
+      const value = argv[++i];
+      if (value === undefined) continue; // dangling flag — nothing to inherit
+      explicit.push(value.startsWith("builtin:") ? value : resolve(process.cwd(), value));
+    } else if (arg === "--no-extensions" || arg === "-ne") {
+      noExtensions = true;
+    }
+  }
+  return { explicit, noExtensions };
+}
 
 /**
  * Map a custom (non-built-in) tool name to the pi-extension file that
@@ -857,21 +899,37 @@ function applySandboxToParts(
     parts.push(flag, shellEscape(spPath));
   }
 
-  // Default-deny: disable global extension discovery and re-enable only the
-  // extensions backing the whitelisted tools. A null allowlist means the spawn
-  // was intentionally unrestricted (e.g. a fork clone) and is replayed as-is.
-  if (loadout.toolAllowlist) {
+  // Extension environment: mirror the parent session's explicit `-e` set and
+  // discovery mode. `--tools` keeps tool access whitelist-only either way —
+  // inherited extensions register tools the model cannot see when they are
+  // outside the allowlist. A null allowlist means the spawn was
+  // intentionally unrestricted and is replayed as-is.
+  //
+  // Legacy snapshots predate the `noExtensions` field: fall back to the old
+  // default-deny rule (restricted spawn → --no-extensions) so resuming an
+  // old session never loads more than the original launch did.
+  const noExtensions = loadout.noExtensions ?? loadout.toolAllowlist != null;
+  if (noExtensions) {
     parts.push("--no-extensions");
+  }
+  if (loadout.toolAllowlist) {
     parts.push("--tools", shellEscape(loadout.toolAllowlist));
+  }
 
-    const extPaths = new Set<string>();
+  // Explicit extensions: the parent's `-e` set plus the extensions backing
+  // the whitelisted tools (required under --no-extensions; harmless with
+  // discovery on — pi dedupes by canonical path). The harness extension
+  // (subagent-done.ts) is added by the callers, not here.
+  const extPaths = new Set<string>();
+  for (const ext of loadout.extensions ?? []) extPaths.add(ext);
+  if (loadout.toolAllowlist) {
     for (const tool of loadout.toolAllowlist.split(",")) {
-      const extPath = getToolExtensionPath(tool);
+      const extPath = getToolExtensionPath(tool.trim());
       if (extPath && existsSync(extPath)) extPaths.add(extPath);
     }
-    for (const extPath of extPaths) {
-      parts.push("-e", shellEscape(extPath));
-    }
+  }
+  for (const extPath of extPaths) {
+    parts.push("-e", shellEscape(extPath));
   }
 }
 
@@ -1134,6 +1192,7 @@ export const __test__ = {
   formatWidgetRightLabel,
   observeRunningSubagent,
   getToolExtensionPath,
+  parseParentExtensionFlags,
   resolveRunningByName,
   uniqueRunningName,
   reservedNames,
@@ -1314,8 +1373,9 @@ async function launchSubagent(
 
   // ── Pi CLI path ──
 
-  // Build pi command
-  const parts: string[] = ["pi"];
+  // Build pi command. Pin the binary to the parent's own install so children
+  // always match the parent version even if the pane shell PATH differs.
+  const parts: string[] = [shellEscape(resolvePiBin())];
   parts.push("--session", shellEscape(subagentSessionFile));
 
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
@@ -1330,10 +1390,17 @@ async function launchSubagent(
       : process.env.PI_CODING_AGENT_DIR ?? null;
 
   // Default-deny model: when an agent restricts its tools (or is granted the
-  // spawning toolset), we disable global extension discovery and re-enable only
-  // the extensions backing the whitelisted tools. Bare/fork spawns with no tool
-  // restriction keep their full default toolset and all global extensions.
+  // spawning toolset), the child's tool access is pinned to the `--tools`
+  // allowlist. The extension environment is inherited from this session
+  // (parent's explicit `-e` set + discovery mode) so a subagent has the same
+  // capabilities as the session that spawned it.
   const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
+
+  // Parse the parent's extension environment from this process's own command
+  // line (the extension runs in-process, so process.argv is the parent's pi
+  // launch). Snapshotted into the loadout so `subagent_message` resume replays
+  // the identical environment.
+  const parentExtensionFlags = parseParentExtensionFlags();
 
   // Snapshot the fully-resolved sandbox beside the session file so a later
   // `subagent_message({ name })` resume can replay the exact same
@@ -1349,6 +1416,8 @@ async function launchSubagent(
     autoExit: agentDefs?.autoExit ?? false,
     cwd: effectiveCwd ?? null,
     agentDir: resolvedAgentDir,
+    extensions: parentExtensionFlags.explicit,
+    noExtensions: parentExtensionFlags.noExtensions,
   };
   writeSubagentLoadout(subagentSessionFile, loadout);
 
@@ -2152,8 +2221,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const surface = createSurface(name);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
-        // Build pi resume command
-        const parts = ["pi", "--session", shellEscape(sessionPath)];
+        // Build pi resume command (same binary the parent runs on)
+        const parts = [shellEscape(resolvePiBin()), "--session", shellEscape(sessionPath)];
 
         // Load subagent-done extension so the agent can self-terminate if needed
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");

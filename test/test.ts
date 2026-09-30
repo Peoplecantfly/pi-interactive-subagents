@@ -335,6 +335,8 @@ describe("session.ts", () => {
       autoExit: true,
       cwd: "/work/dir",
       agentDir: "/home/u/.pi/agent",
+      extensions: ["/abs/parent-ext.ts", "builtin:llama"],
+      noExtensions: false,
     };
 
     it("writes the sidecar next to the session file", () => {
@@ -358,6 +360,31 @@ describe("session.ts", () => {
       const sf = join(dir, "s3.jsonl");
       writeFileSync(sf + ".loadout.json", "not json{", "utf8");
       assert.equal(readSubagentLoadout(sf), null);
+    });
+
+    it("reads legacy sidecars without the extension fields", () => {
+      const sf = join(dir, "s4.jsonl");
+      writeFileSync(
+        sf + ".loadout.json",
+        JSON.stringify({
+          agent: "worker",
+          toolAllowlist: "read,bash",
+          model: null,
+          thinking: null,
+          systemPromptMode: null,
+          identity: null,
+          spawnable: null,
+          autoExit: true,
+          cwd: null,
+          agentDir: null,
+        }),
+        "utf8",
+      );
+      const legacy = readSubagentLoadout(sf);
+      assert.ok(legacy);
+      assert.equal(legacy.noExtensions, undefined);
+      assert.equal(legacy.extensions, undefined);
+      assert.equal(legacy.toolAllowlist, "read,bash");
     });
   });
 
@@ -1341,6 +1368,122 @@ describe("subagent discovery", () => {
         { artifactDir: d, name: "fork" },
       );
       assert.deepEqual(parts, []);
+    });
+  });
+
+  describe("extension inheritance", () => {
+    const baseLoadout = (over: Partial<SubagentLoadout> = {}): SubagentLoadout => ({
+      agent: "worker",
+      toolAllowlist: "read,bash",
+      model: null,
+      thinking: null,
+      systemPromptMode: null,
+      identity: null,
+      spawnable: null,
+      autoExit: true,
+      cwd: null,
+      agentDir: null,
+      ...over,
+    });
+
+    it("mirrors a parent started with --no-extensions", () => {
+      withTempDir((d) => {
+        const parts: string[] = [];
+        testApi.applySandboxToParts(
+          parts,
+          baseLoadout({ noExtensions: true, extensions: ["/abs/parent-ext.ts", "builtin:llama"] }),
+          { artifactDir: d, name: "w" },
+        );
+        assert.ok(parts.includes("--no-extensions"), "expected --no-extensions");
+        const toolsIdx = parts.indexOf("--tools");
+        assert.ok(toolsIdx >= 0, "expected --tools");
+        assert.ok(parts[toolsIdx + 1].includes("read,bash"), "expected tool allowlist");
+        const eEntries: string[] = [];
+        for (let i = 0; i < parts.length; i++) if (parts[i] === "-e") eEntries.push(parts[i + 1]);
+        assert.deepEqual(eEntries, [shellEscape("/abs/parent-ext.ts"), shellEscape("builtin:llama")]);
+      });
+    });
+
+    it("keeps --tools but drops --no-extensions when the parent had discovery on", () => {
+      withTempDir((d) => {
+        const parts: string[] = [];
+        testApi.applySandboxToParts(
+          parts,
+          baseLoadout({ noExtensions: false, extensions: ["/abs/parent-ext.ts"] }),
+          { artifactDir: d, name: "w" },
+        );
+        assert.ok(!parts.includes("--no-extensions"), "expected no --no-extensions");
+        const toolsIdx = parts.indexOf("--tools");
+        assert.ok(toolsIdx >= 0, "expected --tools");
+        const eEntries: string[] = [];
+        for (let i = 0; i < parts.length; i++) if (parts[i] === "-e") eEntries.push(parts[i + 1]);
+        assert.deepEqual(eEntries, [shellEscape("/abs/parent-ext.ts")]);
+      });
+    });
+
+    it("falls back to --no-extensions for legacy restricted snapshots", () => {
+      withTempDir((d) => {
+        const parts: string[] = [];
+        // Legacy shape: no noExtensions / extensions fields at all.
+        testApi.applySandboxToParts(parts, baseLoadout({}), { artifactDir: d, name: "w" });
+        assert.ok(parts.includes("--no-extensions"), "legacy fallback expected --no-extensions");
+      });
+    });
+
+    it("does not add --no-extensions for legacy unrestricted snapshots", () => {
+      withTempDir((d) => {
+        const parts: string[] = [];
+        testApi.applySandboxToParts(parts, baseLoadout({ toolAllowlist: null }), { artifactDir: d, name: "fork" });
+        assert.deepEqual(parts, []);
+      });
+    });
+
+    it("dedupes a parent extension that also backs an allowlisted tool", () => {
+      withTempDir((d) => {
+        const extFile = join(d, "custom-tool.ts");
+        writeFileSync(extFile, "export default () => {}", "utf8");
+        (subagentsModule as any).registerToolExtension("itest_dedup_tool", extFile);
+        const parts: string[] = [];
+        testApi.applySandboxToParts(
+          parts,
+          baseLoadout({ noExtensions: true, toolAllowlist: "read,itest_dedup_tool", extensions: [extFile] }),
+          { artifactDir: d, name: "w" },
+        );
+        const eEntries: string[] = [];
+        for (let i = 0; i < parts.length; i++) if (parts[i] === "-e") eEntries.push(parts[i + 1]);
+        assert.equal(eEntries.filter((p) => p === shellEscape(extFile)).length, 1, "extension listed once");
+      });
+    });
+
+    describe("parseParentExtensionFlags", () => {
+      it("parses -e and --extension values", () => {
+        const r = testApi.parseParentExtensionFlags(["-e", "/abs/a.ts", "--extension", "/abs/b.ts"]);
+        assert.deepEqual(r, { explicit: ["/abs/a.ts", "/abs/b.ts"], noExtensions: false });
+      });
+
+      it("passes builtin:<name> through verbatim", () => {
+        const r = testApi.parseParentExtensionFlags(["-e", "builtin:llama"]);
+        assert.deepEqual(r.explicit, ["builtin:llama"]);
+      });
+
+      it("resolves relative paths against the parent cwd", () => {
+        const r = testApi.parseParentExtensionFlags(["-e", "pi-extension/subagents/index.ts"]);
+        assert.deepEqual(r.explicit, [join(process.cwd(), "pi-extension", "subagents", "index.ts")]);
+      });
+
+      it("detects -ne and --no-extensions", () => {
+        assert.equal(testApi.parseParentExtensionFlags(["-ne"]).noExtensions, true);
+        assert.equal(testApi.parseParentExtensionFlags(["--no-extensions"]).noExtensions, true);
+        assert.equal(testApi.parseParentExtensionFlags(["-e", "x.ts"]).noExtensions, false);
+      });
+
+      it("skips a dangling -e and ignores unrelated flags", () => {
+        assert.deepEqual(
+          testApi.parseParentExtensionFlags(["--session", "/s.jsonl", "-t", "read,bash", "-e"]),
+          { explicit: [], noExtensions: false },
+        );
+        assert.deepEqual(testApi.parseParentExtensionFlags([]), { explicit: [], noExtensions: false });
+      });
     });
   });
 
