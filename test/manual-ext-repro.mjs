@@ -1,5 +1,8 @@
 // Manual repro: parent pi with discovery + explicit -e extension spawns a
 // subagent; we then capture the child pane's startup [Extensions] section.
+// NOTE: no `--model` on the parent — pi exits at startup for an unresolvable
+// --model value, so the `model-provider/model-id` placeholder may only appear
+// in agent frontmatter (resolved by the extension), never on pi's CLI.
 import { createSurface, sendLongCommand, readScreen, closeSurface } from "../pi-extension/subagents/tmux.ts";
 import { execSync } from "node:child_process";
 
@@ -12,7 +15,7 @@ const s = createSurface("exttest");
 await sleep(1000);
 const task =
   'Call the subagent tool once with these exact parameters: name "ExtReport", agent "scout", task "Reply with the single word OK". Do nothing else.';
-sendLongCommand(s, `cd /home/pplcf/src/pi-interactive-subagents && ${PI} -e ${EXT} --model usergate/Qwen3.8-27B ${JSON.stringify(task)}`);
+sendLongCommand(s, `cd /home/pplcf/src/pi-interactive-subagents && ${PI} -e ${EXT} ${JSON.stringify(task)}`);
 console.log("PARENT=" + s);
 
 // wait until a second pane appears (child), then capture both

@@ -67,8 +67,20 @@ const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.
 
 // ── Configuration ──
 
-/** Model used for integration tests. Override with PI_TEST_MODEL env var. */
-export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "usergate/Qwen3.8-27B";
+/**
+ * Model used for integration tests. Required: PI_TEST_MODEL must name a
+ * provider/model that works on this machine. There is no built-in default —
+ * a hard-coded gateway model would break the suite on any other machine.
+ */
+export const TEST_MODEL: string =
+  process.env.PI_TEST_MODEL ??
+  (() => {
+    throw new Error(
+      "PI_TEST_MODEL is not set. Integration tests require a working model; " +
+        "set it to <provider>/<model-id> for a provider with configured auth, " +
+        "e.g. PI_TEST_MODEL=<provider>/<model-id> npm run test:integration.",
+    );
+  })();
 
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var.
  * 300s default: tests run real LLM sessions; a 27B gateway model can take

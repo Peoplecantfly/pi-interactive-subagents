@@ -3,7 +3,7 @@ name: worker
 description: General-purpose worker — reads, writes, and edits code
 tools: read, write, edit, bash, web_search, web_fetch
 subagent_agents: scout, researcher
-model: usergate/Qwen3.8-27B
+model: model-provider/model-id
 thinking: high
 system-prompt: append
 auto-exit: true

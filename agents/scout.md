@@ -2,7 +2,7 @@
 name: scout
 description: Fast codebase recon — explores files, finds patterns, maps architecture
 tools: read, grep, find, ls
-model: usergate/Qwen3.8-27B
+model: model-provider/model-id
 thinking: low
 system-prompt: append
 auto-exit: true

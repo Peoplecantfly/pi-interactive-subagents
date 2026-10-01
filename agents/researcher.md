@@ -2,7 +2,7 @@
 name: researcher
 description: Web researcher — searches the web and synthesizes findings
 tools: web_search, web_fetch, safe_bash
-model: usergate/Qwen3.8-27B
+model: model-provider/model-id
 thinking: medium
 system-prompt: append
 auto-exit: true

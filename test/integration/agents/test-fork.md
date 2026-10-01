@@ -1,9 +1,10 @@
 ---
-name: test-echo
-description: Integration test agent — completes simple file-writing tasks
+name: test-fork
+description: Integration test agent — fork-mode file-writing task
 model: model-provider/model-id
 tools: read, bash, write, edit
 spawning: false
+session-mode: fork
 auto-exit: true
 disable-model-invocation: true
 ---

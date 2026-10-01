@@ -12,12 +12,14 @@
  *   tmux new 'npm run test:integration'
  *
  * Configuration:
- *   PI_TEST_MODEL     — model for all pi sessions (default: anthropic/claude-haiku-4-5)
+ *   PI_TEST_MODEL     — required; model for all pi sessions (no built-in default)
  *   PI_TEST_TIMEOUT   — per-test timeout in ms (default: 120000)
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import {
   getAvailableBackends,
   createTestEnv,
@@ -31,6 +33,7 @@ import {
   trackTempFile,
   readScreen,
   PI_TIMEOUT,
+  TEST_MODEL,
   type TestEnv,
 } from "./harness.ts";
 
@@ -100,6 +103,99 @@ for (const backend of backends) {
         const header = JSON.parse(lines[0]);
         assert.equal(header.type, "session", "First entry should be session header");
         assert.ok(header.id, "Session header should have an id");
+      }
+
+      // ── Model fallback (change: subagent-model-fallback, task 4.1) ──
+      // test-echo declares the unresolvable `model-provider/model-id`
+      // placeholder, so the child must have run on the parent's model
+      // (PI_TEST_MODEL). Verified from files on disk: the loadout snapshot
+      // records the resolved model, the child session's LLM turns ran on it,
+      // and the spawn tool result (recorded in the parent session) notes the
+      // fallback.
+      const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+      const childSessionDir = join(
+        agentDir,
+        "sessions",
+        `--${env.dir.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`,
+      );
+      assert.ok(existsSync(childSessionDir), `child session dir missing: ${childSessionDir}`);
+      const loadouts = readdirSync(childSessionDir)
+        .filter((f) => f.endsWith(".jsonl.loadout.json"))
+        .sort((a, b) =>
+          statSync(join(childSessionDir, b)).mtimeMs - statSync(join(childSessionDir, a)).mtimeMs,
+        );
+      assert.ok(loadouts.length >= 1, `no loadout sidecar found in ${childSessionDir}`);
+      const childSessionName = loadouts[0].slice(0, -".loadout.json".length);
+      const childSessionFile = join(childSessionDir, childSessionName);
+      assert.ok(existsSync(childSessionFile), `child session file missing: ${childSessionFile}`);
+
+      // 1. The launch snapshot records the RESOLVED model, not the placeholder.
+      const loadout = JSON.parse(readFileSync(`${childSessionFile}.loadout.json`, "utf8"));
+      assert.equal(
+        loadout.model,
+        TEST_MODEL,
+        `loadout.model should record the resolved parent model ${TEST_MODEL}, got: ${loadout.model}`,
+      );
+
+      // 2. The child session actually ran on that model: every assistant turn
+      // and model_change entry matches TEST_MODEL's provider/id.
+      const childEntries = readFileSync(childSessionFile, "utf8")
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l));
+      const expectedProvider = TEST_MODEL.split("/")[0];
+      const expectedModelId = TEST_MODEL.split("/").slice(1).join("/");
+      const assistantModels = childEntries
+        .filter((e) => e.type === "message" && e.message?.role === "assistant")
+        .map((e) => e.message.model)
+        .filter((m: unknown) => typeof m === "string" && m !== "");
+      assert.ok(
+        assistantModels.length >= 1,
+        "child session has no assistant turns — the child never made an LLM call",
+      );
+      const unexpectedModels = [...new Set(assistantModels)].filter((m) => m !== expectedModelId);
+      assert.deepEqual(
+        unexpectedModels,
+        [],
+        `child session ran on unexpected models ${JSON.stringify(new Set(assistantModels))}; expected ${expectedModelId} (parent model ${TEST_MODEL})`,
+      );
+      for (const c of childEntries.filter((e) => e.type === "model_change")) {
+        assert.equal(c.provider, expectedProvider, `model_change provider mismatch: ${c.provider}`);
+        assert.equal(c.modelId, expectedModelId, `model_change modelId mismatch: ${c.modelId}`);
+      }
+
+      // 3. The spawn tool result noted the fallback. Parent sessions record
+      // every tool result, so scan the sibling session files (the child's own
+      // session is excluded) for this test's spawn result.
+      const spawnResults: string[] = [];
+      for (const f of readdirSync(childSessionDir)) {
+        if (!f.endsWith(".jsonl") || f === childSessionName) continue;
+        for (const line of readFileSync(join(childSessionDir, f), "utf8").trim().split("\n")) {
+          let e: { type?: string; message?: { role?: string; content?: unknown } };
+          try {
+            e = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          if (e.type !== "message" || e.message?.role !== "toolResult") continue;
+          const text = (Array.isArray(e.message.content) ? e.message.content : [])
+            .filter((b): b is { type: string; text: string } => !!b && (b as any).type === "text" && typeof (b as any).text === "string")
+            .map((b) => b.text)
+            .join("\n");
+          if (text.includes("launched and is now running") && text.includes(`Sub-agent "Echo-${id}"`)) {
+            spawnResults.push(text);
+          }
+        }
+      }
+      assert.ok(
+        spawnResults.length >= 1,
+        "parent session did not record the Echo subagent's spawn tool result",
+      );
+      for (const text of spawnResults) {
+        assert.ok(
+          text.includes(`model fallback: model-provider/model-id → ${TEST_MODEL}`),
+          `spawn result should note the fallback to ${TEST_MODEL}; got: ${text.slice(0, 300)}`,
+        );
       }
     });
 
@@ -201,9 +297,9 @@ for (const backend of backends) {
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
         `  name: "Fork-${id}"`,
-        `  fork: true`,
+        `  agent: "test-fork"`,
         `  task: "Run this bash command: echo 'FORK_OK_${id}' > '${markerFile}'"`,
-        `Do not set the agent parameter. Just set name, fork, and task.`,
+        `Do not do anything else. Just call the subagent tool once.`,
         `After you receive the result, say FORK_COMPLETE.`,
       ].join("\n");
 

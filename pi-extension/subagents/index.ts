@@ -668,6 +668,8 @@ interface RunningSubagent {
    * subagent's pane (e.g. planner).
    */
   interactive: boolean;
+  /** Fallback note from model resolution, surfaced in the spawn tool result. */
+  modelNote?: string;
 }
 
 /** All currently running subagents, keyed by id. */
@@ -1185,6 +1187,7 @@ export const __test__ = {
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
+  resolveSubagentModel,
   resolveEffectiveInteractive,
   buildSubagentToolAllowlist,
   applySandboxToParts,
@@ -1218,6 +1221,117 @@ function startWidgetRefresh() {
   (globalThis as any)[WIDGET_INTERVAL_KEY] = widgetInterval;
 }
 
+// ── Subagent model resolution ──
+
+/**
+ * Structural view of the model objects the extension reads at tool-call time
+ * (`ExtensionContext.model` / `.modelRegistry` on pi 0.99.1). Deliberately
+ * local instead of importing pi's Model/ModelRegistry types — the devDep
+ * copy of pi is older than the runtime pi and its types can drift.
+ */
+type SubagentModelView = { provider?: string; id?: string };
+interface SubagentModelRegistryView {
+  // Method syntax (not function-typed properties) so parameter checks are
+  // bivariant: the real registry's `hasConfiguredAuth(model: Model)` takes a
+  // richer model type than this view, which strict function-typed properties
+  // would reject on the ctx passed from the tool call.
+  find?(provider: string, modelId: string): SubagentModelView | null | undefined;
+  getAll?(): SubagentModelView[];
+  hasConfiguredAuth?(model: SubagentModelView): boolean;
+}
+
+/** Strip a trailing `:<thinking>` level from a model ref, for validation. */
+function stripThinkingSuffix(ref: string): string {
+  const idx = ref.lastIndexOf(":");
+  return idx > 0 ? ref.slice(0, idx) : ref;
+}
+
+/**
+ * Check one requested model ref against the parent session's registry.
+ * Strict: a `provider/id` ref (first slash) must match
+ * `find(provider, id)` exactly; a slash-less ref must be an exact id in
+ * `getAll()`; and the provider must have configured auth. Anything we cannot
+ * verify this way is unusable — pi's CLI resolver fuzzy-matches typos to
+ * *other* models, which is worse than falling back.
+ */
+function checkRequestedModel(
+  ref: string,
+  registry: SubagentModelRegistryView | null | undefined,
+): { ok: true } | { ok: false; reason: string } {
+  if (!registry || typeof registry.find !== "function") {
+    return { ok: false, reason: "model registry unavailable" };
+  }
+  const bare = stripThinkingSuffix(ref);
+  const slash = bare.indexOf("/");
+  let candidate: SubagentModelView | null | undefined;
+  if (slash > 0) {
+    candidate = registry.find(bare.slice(0, slash), bare.slice(slash + 1));
+  } else if (typeof registry.getAll === "function") {
+    candidate = registry.getAll().find((m) => m.id === bare);
+  } else {
+    return { ok: false, reason: "model registry unavailable" };
+  }
+  if (!candidate) {
+    return { ok: false, reason: slash > 0 ? "unknown model" : "unknown model id" };
+  }
+  if (typeof registry.hasConfiguredAuth !== "function") {
+    return { ok: false, reason: "model registry unavailable" };
+  }
+  if (!registry.hasConfiguredAuth(candidate)) {
+    return { ok: false, reason: "no configured auth" };
+  }
+  return { ok: true };
+}
+
+/**
+ * Resolve the model for a subagent launch: the requested model (validated
+ * strictly against the parent session's registry) → the parent's current
+ * model → pi's configured default (null = no --model flag). Pure over its
+ * inputs (no fs/tmux) so unit tests can pass fake registries. `requested`
+ * may carry a `:<thinking>` suffix — it is stripped before validation and
+ * preserved in the returned ref when the model is valid; fallback models
+ * never get a suffix injected. A registry that is absent or lacks the
+ * methods needed to validate degrades to the fallback, never to launching
+ * with an unverified model.
+ */
+export function resolveSubagentModel(
+  requested: string | null | undefined,
+  ctx: { model?: SubagentModelView | null; modelRegistry?: SubagentModelRegistryView | null },
+): { model: string | null; source: "requested" | "parent" | "default"; note?: string } {
+  const parent = ctx.model;
+  const parentModel =
+    parent && parent.provider && parent.id ? `${parent.provider}/${parent.id}` : null;
+
+  if (!requested) {
+    if (parentModel) {
+      return {
+        model: parentModel,
+        source: "parent",
+        note: `model fallback: (none requested) → ${parentModel} (parent model)`,
+      };
+    }
+    return { model: null, source: "default" };
+  }
+
+  const check = checkRequestedModel(requested, ctx.modelRegistry);
+  if (check.ok) {
+    return { model: requested, source: "requested" };
+  }
+
+  if (parentModel) {
+    return {
+      model: parentModel,
+      source: "parent",
+      note: `model fallback: ${requested} → ${parentModel} (${check.reason}; parent model)`,
+    };
+  }
+  return {
+    model: null,
+    source: "default",
+    note: `model fallback: ${requested} → pi default (${check.reason}; parent has no model)`,
+  };
+}
+
 /**
  * Launch a subagent: creates the multiplexer pane, builds the command, and
  * sends it. Returns a RunningSubagent — does NOT poll.
@@ -1226,7 +1340,12 @@ function startWidgetRefresh() {
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  ctx: {
+    sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string };
+    cwd: string;
+    model?: SubagentModelView | null;
+    modelRegistry?: SubagentModelRegistryView | null;
+  },
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
@@ -1402,14 +1521,35 @@ async function launchSubagent(
   // the identical environment.
   const parentExtensionFlags = parseParentExtensionFlags();
 
+  // Resolve the model against this session's registry before launch. A
+  // requested model that is unresolvable or unauthenticated here would
+  // hard-fail the child pi (unknown provider → exit at startup; unknown id
+  // → dies on the first LLM call), so fall back to the parent's current
+  // model, then to pi's configured default (no --model flag). The resolved
+  // value — not the requested one — is what the loadout snapshot records.
+  const resolvedModel = resolveSubagentModel(effectiveModel, ctx);
+
+  // A valid requested model may carry its own `:thinking` suffix; split it
+  // off so the snapshot's model stays suffix-free (the agent frontmatter's
+  // thinking level applies when the resolved model has no suffix of its own).
+  let loadoutModel: string | null = resolvedModel.model;
+  let loadoutThinking: string | null = effectiveThinking ?? null;
+  if (resolvedModel.model) {
+    const suffixIdx = resolvedModel.model.lastIndexOf(":");
+    if (suffixIdx > 0) {
+      loadoutModel = resolvedModel.model.slice(0, suffixIdx);
+      loadoutThinking = resolvedModel.model.slice(suffixIdx + 1);
+    }
+  }
+
   // Snapshot the fully-resolved sandbox beside the session file so a later
   // `subagent_message({ name })` resume can replay the exact same
   // restriction instead of relaunching pi with all global extensions + tools.
   const loadout: SubagentLoadout = {
     agent: params.agent ?? null,
     toolAllowlist,
-    model: effectiveModel ?? null,
-    thinking: effectiveThinking ?? null,
+    model: loadoutModel,
+    thinking: loadoutThinking,
     systemPromptMode: systemPromptMode ?? null,
     identity: identityInSystemPrompt ? identity : null,
     spawnable: agentDefs?.subagentAgents ?? null,
@@ -1516,6 +1656,7 @@ async function launchSubagent(
       source: "pi",
       startTimeMs: startTime,
     }),
+    modelNote: resolvedModel.note,
   };
 
   runningSubagents.set(id, running);
@@ -1684,7 +1825,9 @@ async function watchSubagent(
   } catch (err: any) {
     try {
       closeSurface(surface);
-    } catch {}
+    } catch {
+      // Best-effort cleanup: the pane may already be gone.
+    }
     runningSubagents.delete(running.id);
 
     if (signal.aborted) {
@@ -1942,7 +2085,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 `Sub-agent "${params.name}" launched and is now running in the background. ` +
                 `Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
                 `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
-                `Until then, move on to other work or tell the user you're waiting.`,
+                `Until then, move on to other work or tell the user you're waiting.` +
+                (running.modelNote ? `\nNote: ${running.modelNote}` : ""),
             },
           ],
           details: {
@@ -2193,7 +2337,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // mutating the same .jsonl corrupts it. Steer it by name instead.
         for (const r of runningSubagents.values()) {
           if (resolve(r.sessionFile) === resolve(sessionPath)) {
-            const err = `Subagent "${requestedName}" is still running as "${r.name}". Your message will steer it; resending as a steer.`;
             return handleSubagentSteer({ name: r.name, message: params.message });
           }
         }
@@ -2233,8 +2376,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
 
+        // Re-validate the snapshotted model through the same resolver spawn
+        // uses: a model that resolved at spawn time may no longer exist or
+        // have credentials. Fall back to this session's current model (or no
+        // --model flag) rather than hard-failing the child — mirrors pi's
+        // own resume fallback. Shallow-copy the loadout before mutating so
+        // the snapshot itself is not rewritten.
+        const resumedModel = resolveSubagentModel(loadout.model, ctx);
+        const replayLoadout = resumedModel.note ? { ...loadout, model: resumedModel.model } : loadout;
+
         // Replay the model, identity, and default-deny tool/extension sandbox.
-        applySandboxToParts(parts, loadout, { artifactDir, name });
+        applySandboxToParts(parts, replayLoadout, { artifactDir, name });
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
@@ -2375,7 +2527,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           });
 
         return {
-          content: [{ type: "text", text: `Session "${name}" resumed.` }],
+          content: [
+            {
+              type: "text",
+              text:
+                `Session "${name}" resumed.` +
+                (resumedModel.note ? ` Note: ${resumedModel.note}` : ""),
+            },
+          ],
           details: {
             id,
             name,

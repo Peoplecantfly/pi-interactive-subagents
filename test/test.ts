@@ -1612,6 +1612,140 @@ describe("subagent discovery", () => {
     });
   });
 });
+describe("resolveSubagentModel", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  // A fake registry mirroring the structural surface the extension uses:
+  // find(provider, modelId) → exact model or undefined, getAll() → every model,
+  // hasConfiguredAuth(model) → boolean.
+  function makeRegistry(opts: {
+    models?: Array<{ provider: string; id: string }>;
+    noAuth?: Set<string>;
+    omitFind?: boolean;
+    omitAuth?: boolean;
+  } = {}) {
+    const models = opts.models ?? [
+      { provider: "openrouter", id: "z-ai/glm-5.2" },
+      { provider: "openai", id: "gpt-4o" },
+    ];
+    const noAuth = opts.noAuth ?? new Set<string>();
+    const reg: Record<string, unknown> = {};
+    if (!opts.omitFind) {
+      reg.find = (provider: string, modelId: string) =>
+        models.find((m) => m.provider === provider && m.id === modelId);
+    }
+    reg.getAll = () => models;
+    if (!opts.omitAuth) {
+      reg.hasConfiguredAuth = (m: { provider: string; id: string }) =>
+        !noAuth.has(`${m.provider}/${m.id}`);
+    }
+    return reg;
+  }
+
+  const parent = { provider: "anthropic", id: "claude-sonnet" };
+
+  it("passes a valid requested model through, preserving the thinking suffix", () => {
+    const reg = makeRegistry();
+    // Valid provider/id, no auth issue, with a :thinking suffix.
+    assert.deepEqual(
+      testApi.resolveSubagentModel("openrouter/z-ai/glm-5.2:high", {
+        model: parent,
+        modelRegistry: reg,
+      }),
+      { model: "openrouter/z-ai/glm-5.2:high", source: "requested" },
+    );
+  });
+
+  it("falls back to the parent model when the provider is unknown", () => {
+    const reg = makeRegistry();
+    const r = testApi.resolveSubagentModel("model-provider/model-id", {
+      model: parent,
+      modelRegistry: reg,
+    });
+    assert.equal(r.source, "parent");
+    assert.equal(r.model, "anthropic/claude-sonnet");
+    assert.ok(r.note, "expected a fallback note");
+    assert.match(r.note, /model-provider\/model-id/);
+  });
+
+  it("falls back to the parent model when the provider is known but the id is not", () => {
+    const reg = makeRegistry();
+    const r = testApi.resolveSubagentModel("openai/does-not-exist", {
+      model: parent,
+      modelRegistry: reg,
+    });
+    assert.equal(r.source, "parent");
+    assert.equal(r.model, "anthropic/claude-sonnet");
+    assert.ok(r.note, "expected a fallback note");
+  });
+
+  it("falls back to the parent model when the model has no configured auth", () => {
+    const reg = makeRegistry({
+      models: [{ provider: "openai", id: "gpt-4o" }],
+      noAuth: new Set(["openai/gpt-4o"]),
+    });
+    const r = testApi.resolveSubagentModel("openai/gpt-4o", {
+      model: parent,
+      modelRegistry: reg,
+    });
+    assert.equal(r.source, "parent");
+    assert.equal(r.model, "anthropic/claude-sonnet");
+    assert.ok(r.note, "expected a fallback note");
+  });
+
+  it("uses the parent model when no model is requested", () => {
+    const reg = makeRegistry();
+    const r = testApi.resolveSubagentModel(null, { model: parent, modelRegistry: reg });
+    assert.equal(r.source, "parent");
+    assert.equal(r.model, "anthropic/claude-sonnet");
+    assert.ok(r.note, "expected a fallback note");
+  });
+
+  it("resolves a slash-less ref by exact id across getAll()", () => {
+    const reg = makeRegistry();
+    const r = testApi.resolveSubagentModel("gpt-4o", { model: parent, modelRegistry: reg });
+    assert.equal(r.source, "requested");
+    assert.equal(r.model, "gpt-4o");
+    assert.equal(r.note, undefined);
+  });
+
+  it("falls back to the parent model when the registry is absent", () => {
+    const r = testApi.resolveSubagentModel("openai/gpt-4o", { model: parent });
+    assert.equal(r.source, "parent");
+    assert.equal(r.model, "anthropic/claude-sonnet");
+    assert.ok(r.note, "expected a fallback note");
+  });
+
+  it("falls back to the parent model when the registry lacks the methods to validate", () => {
+    const reg = makeRegistry({ omitAuth: true }); // find+getAll, no hasConfiguredAuth
+    const r = testApi.resolveSubagentModel("openai/gpt-4o", {
+      model: parent,
+      modelRegistry: reg,
+    });
+    assert.equal(r.source, "parent");
+    assert.equal(r.model, "anthropic/claude-sonnet");
+    assert.ok(r.note, "expected a fallback note");
+  });
+
+  it("returns null/default when nothing resolves and there is no parent model", () => {
+    const reg = makeRegistry();
+    const r = testApi.resolveSubagentModel("model-provider/model-id", {
+      model: undefined,
+      modelRegistry: reg,
+    });
+    assert.equal(r.source, "default");
+    assert.equal(r.model, null);
+    assert.ok(r.note, "expected a fallback note");
+  });
+
+  it("returns null/default when nothing is requested and there is no parent model", () => {
+    const r = testApi.resolveSubagentModel(null, { model: undefined });
+    assert.equal(r.source, "default");
+    assert.equal(r.model, null);
+    assert.equal(r.note, undefined);
+  });
+});
+
 describe("subagent-done.ts", () => {
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {

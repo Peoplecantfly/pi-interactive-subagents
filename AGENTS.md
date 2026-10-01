@@ -24,7 +24,8 @@ There is no lint, format, type-check, build, or CI script. Verification is the u
 ## Integration test prerequisites
 
 - `tmux` and `pi` on PATH, and a working model provider / API key.
-- Model defaults to `usergate/Qwen3.8-27B`; override with `PI_TEST_MODEL`. `PI_TEST_TIMEOUT` (default 300000 ms) sets the per-test timeout. Test panes run the pi binary next to the test runner's node (`PI_TEST_BIN` overrides); `npm run` puts the project's `node_modules/.bin` (older pi from devDependencies) first on PATH, so bare `pi` is not used.
+- **`PI_TEST_MODEL` is required** (no built-in default) — name a `provider/model` with configured auth for this machine; the harness throws a descriptive error at load if it is unset. `PI_TEST_TIMEOUT` (default 300000 ms) sets the per-test timeout. Test panes run the pi binary next to the test runner's node (`PI_TEST_BIN` overrides); `npm run` puts the project's `node_modules/.bin` (older pi from devDependencies) first on PATH, so bare `pi` is not used.
+- **pi docs / sources live in the installed pi, not in `node_modules/`.** When you need pi's behavior, read the installed pi: the agent dir under `~/.pi/...` and the global install, e.g. `~/.nvm/versions/node/<ver>/lib/node_modules/@earendil-works/pi-coding-agent`. `node_modules/` here holds only dev dependencies (`@mariozechner/pi-coding-agent` 0.65.0) used to run tests — an older pi whose types can drift from the runtime; never read it for current pi behavior.
 - Run serialized (`--test-concurrency=1`): tests share tmux panes and screen state.
 - The harness force-loads the working-tree extension via `pi -ne -e pi-extension/subagents/index.ts`, never an installed pi-package — edits in the working tree are the code under test.
 

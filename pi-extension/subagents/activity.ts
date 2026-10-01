@@ -179,6 +179,8 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
   ].find((error) => error != null);
   if (validationError) return invalidActivity(validationError);
 
+  // SAFETY: every field was validated above (types, ranges, enums) to match
+  // SubagentActivityState before this cast.
   return { ok: true, activity: object as unknown as SubagentActivityState };
 }
 

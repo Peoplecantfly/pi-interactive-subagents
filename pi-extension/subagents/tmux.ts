@@ -74,7 +74,7 @@ export function shellEscape(s: string): string {
  * Switchable: "even-horizontal" (equal columns, matches Ctrl+b Alt+1),
  * "main-vertical" (big main pane + tiled column), "tiled" (grid).
  */
-const SUBAGENT_TMUX_LAYOUT = "even-horizontal";
+const SUBAGENT_TMUX_LAYOUT = "main-vertical";
 
 let rebalanceTimer: ReturnType<typeof setTimeout> | null = null;
 

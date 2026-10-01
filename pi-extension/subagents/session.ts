@@ -98,7 +98,11 @@ export interface SubagentLoadout {
   agent: string | null;
   /** The `--tools` allowlist string, or null when the spawn was unrestricted. */
   toolAllowlist: string | null;
-  /** Model id (without thinking suffix), or null to use the session default. */
+  /**
+   * The model the child actually ran on, post-fallback (resolved against the
+   * spawning parent's registry at spawn time), without thinking suffix;
+   * null means the child ran on pi's configured default.
+   */
   model: string | null;
   /** Thinking level appended to the model as `model:level`, or null. */
   thinking: string | null;
