@@ -1240,10 +1240,10 @@ interface SubagentModelRegistryView {
   hasConfiguredAuth?(model: SubagentModelView): boolean;
 }
 
-/** Strip a trailing `:<thinking>` level from a model ref, for validation. */
-function stripThinkingSuffix(ref: string): string {
+/** Split a model ref into its base and optional `:<thinking>` suffix. */
+function splitThinkingSuffix(ref: string): { base: string; thinking: string | null } {
   const idx = ref.lastIndexOf(":");
-  return idx > 0 ? ref.slice(0, idx) : ref;
+  return idx > 0 ? { base: ref.slice(0, idx), thinking: ref.slice(idx + 1) } : { base: ref, thinking: null };
 }
 
 /**
@@ -1261,7 +1261,7 @@ function checkRequestedModel(
   if (!registry || typeof registry.find !== "function") {
     return { ok: false, reason: "model registry unavailable" };
   }
-  const bare = stripThinkingSuffix(ref);
+  const { base: bare } = splitThinkingSuffix(ref);
   const slash = bare.indexOf("/");
   let candidate: SubagentModelView | null | undefined;
   if (slash > 0) {
@@ -1288,16 +1288,17 @@ function checkRequestedModel(
  * strictly against the parent session's registry) → the parent's current
  * model → pi's configured default (null = no --model flag). Pure over its
  * inputs (no fs/tmux) so unit tests can pass fake registries. `requested`
- * may carry a `:<thinking>` suffix — it is stripped before validation and
- * preserved in the returned ref when the model is valid; fallback models
- * never get a suffix injected. A registry that is absent or lacks the
+ * may carry a `:<thinking>` suffix — it is stripped before validation and,
+ * when the model is valid, returned suffix-free with the suffix in
+ * `thinking`; fallback models get `thinking: null` (the caller applies its
+ * own default). A registry that is absent or lacks the
  * methods needed to validate degrades to the fallback, never to launching
  * with an unverified model.
  */
 export function resolveSubagentModel(
   requested: string | null | undefined,
   ctx: { model?: SubagentModelView | null; modelRegistry?: SubagentModelRegistryView | null },
-): { model: string | null; source: "requested" | "parent" | "default"; note?: string } {
+): { model: string | null; thinking: string | null; source: "requested" | "parent" | "default"; note?: string } {
   const parent = ctx.model;
   const parentModel =
     parent && parent.provider && parent.id ? `${parent.provider}/${parent.id}` : null;
@@ -1306,27 +1307,31 @@ export function resolveSubagentModel(
     if (parentModel) {
       return {
         model: parentModel,
+        thinking: null,
         source: "parent",
         note: `model fallback: (none requested) → ${parentModel} (parent model)`,
       };
     }
-    return { model: null, source: "default" };
+    return { model: null, thinking: null, source: "default" };
   }
 
   const check = checkRequestedModel(requested, ctx.modelRegistry);
   if (check.ok) {
-    return { model: requested, source: "requested" };
+    const { base, thinking } = splitThinkingSuffix(requested);
+    return { model: base, thinking, source: "requested" };
   }
 
   if (parentModel) {
     return {
       model: parentModel,
+      thinking: null,
       source: "parent",
       note: `model fallback: ${requested} → ${parentModel} (${check.reason}; parent model)`,
     };
   }
   return {
     model: null,
+    thinking: null,
     source: "default",
     note: `model fallback: ${requested} → pi default (${check.reason}; parent has no model)`,
   };
@@ -1529,27 +1534,14 @@ async function launchSubagent(
   // value — not the requested one — is what the loadout snapshot records.
   const resolvedModel = resolveSubagentModel(effectiveModel, ctx);
 
-  // A valid requested model may carry its own `:thinking` suffix; split it
-  // off so the snapshot's model stays suffix-free (the agent frontmatter's
-  // thinking level applies when the resolved model has no suffix of its own).
-  let loadoutModel: string | null = resolvedModel.model;
-  let loadoutThinking: string | null = effectiveThinking ?? null;
-  if (resolvedModel.model) {
-    const suffixIdx = resolvedModel.model.lastIndexOf(":");
-    if (suffixIdx > 0) {
-      loadoutModel = resolvedModel.model.slice(0, suffixIdx);
-      loadoutThinking = resolvedModel.model.slice(suffixIdx + 1);
-    }
-  }
-
   // Snapshot the fully-resolved sandbox beside the session file so a later
   // `subagent_message({ name })` resume can replay the exact same
   // restriction instead of relaunching pi with all global extensions + tools.
   const loadout: SubagentLoadout = {
     agent: params.agent ?? null,
     toolAllowlist,
-    model: loadoutModel,
-    thinking: loadoutThinking,
+    model: resolvedModel.model,
+    thinking: resolvedModel.thinking ?? effectiveThinking ?? null,
     systemPromptMode: systemPromptMode ?? null,
     identity: identityInSystemPrompt ? identity : null,
     spawnable: agentDefs?.subagentAgents ?? null,

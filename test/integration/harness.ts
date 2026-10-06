@@ -72,15 +72,15 @@ const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.
  * provider/model that works on this machine. There is no built-in default —
  * a hard-coded gateway model would break the suite on any other machine.
  */
-export const TEST_MODEL: string =
-  process.env.PI_TEST_MODEL ??
-  (() => {
-    throw new Error(
-      "PI_TEST_MODEL is not set. Integration tests require a working model; " +
-        "set it to <provider>/<model-id> for a provider with configured auth, " +
-        "e.g. PI_TEST_MODEL=<provider>/<model-id> npm run test:integration.",
-    );
-  })();
+const testModelEnv = process.env.PI_TEST_MODEL;
+if (!testModelEnv) {
+  throw new Error(
+    "PI_TEST_MODEL is not set. Integration tests require a working model; " +
+      "set it to <provider>/<model-id> for a provider with configured auth, " +
+      "e.g. PI_TEST_MODEL=<provider>/<model-id> npm run test:integration.",
+  );
+}
+export const TEST_MODEL: string = testModelEnv;
 
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var.
  * 300s default: tests run real LLM sessions; a 27B gateway model can take

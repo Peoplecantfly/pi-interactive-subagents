@@ -1652,7 +1652,7 @@ describe("resolveSubagentModel", () => {
         model: parent,
         modelRegistry: reg,
       }),
-      { model: "openrouter/z-ai/glm-5.2:high", source: "requested" },
+      { model: "openrouter/z-ai/glm-5.2", thinking: "high", source: "requested" },
     );
   });
 
